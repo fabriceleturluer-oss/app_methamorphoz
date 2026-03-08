@@ -2310,22 +2310,102 @@ def fetch_natisoft_hourly_data(workspace_id: str = "") -> pd.DataFrame:
     workspace_clean = workspace_id.strip()
     if workspace_clean:
         params["workspace"] = workspace_clean
+    base_urls = natisoft_base_urls(config)
+    referer_base = base_urls[0] if base_urls else "https://natisoft-connect.valpronat.com"
     headers = {
         "Authorization": f"Bearer {token}",
         "User-Agent": "APP-Terrain/1.0",
         "Accept": "text/csv",
         "bkr-workspace-id": workspace_clean,
     }
+    if workspace_clean:
+        headers["Referer"] = f"{referer_base}/workspaces/{workspace_clean}/integrators/energy"
+        headers["Origin"] = referer_base
 
-    export_res = requests.get(config["export_url"], params=params, headers=headers, timeout=60)
-    export_res.raise_for_status()
+    attempts: list[tuple[str, str, dict | None]] = []
+    configured_export_url = str(config.get("export_url", "") or "").strip()
+    if configured_export_url:
+        attempts.append(("configured_export", configured_export_url, params))
 
-    text = export_res.text
-    if not text.strip():
-        return pd.DataFrame()
+    for base in base_urls:
+        if workspace_clean:
+            attempts.extend(
+                [
+                    (
+                        "integrator_value_sy_m3",
+                        f"{base}/sy/workspaces/{quote(workspace_clean, safe='')}/integrator/value/export/csv/{quote('m³', safe='')}/{quote(today_date, safe='')}/year",
+                        {
+                            "from": today_date,
+                            "to": today_date,
+                            "workspace": workspace_clean,
+                        },
+                    ),
+                    (
+                        "integrator_value_sy_m3_ascii",
+                        f"{base}/sy/workspaces/{quote(workspace_clean, safe='')}/integrator/value/export/csv/m3/{quote(today_date, safe='')}/year",
+                        {
+                            "from": today_date,
+                            "to": today_date,
+                            "workspace": workspace_clean,
+                        },
+                    ),
+                    (
+                        "integrator_value_sy_nm3",
+                        f"{base}/sy/workspaces/{quote(workspace_clean, safe='')}/integrator/value/export/csv/Nm3/{quote(today_date, safe='')}/year",
+                        {
+                            "from": today_date,
+                            "to": today_date,
+                            "workspace": workspace_clean,
+                        },
+                    ),
+                    (
+                        "integrator_value_api_sy_m3",
+                        f"{base}/api/sy/workspaces/{quote(workspace_clean, safe='')}/integrator/value/export/csv/{quote('m³', safe='')}/{quote(today_date, safe='')}/year",
+                        {
+                            "from": today_date,
+                            "to": today_date,
+                            "workspace": workspace_clean,
+                        },
+                    ),
+                ]
+            )
 
-    df = _parse_natisoft_csv_text(text)
-    return df
+        attempts.extend(
+            [
+                ("hourly_model_api_api", f"{base}/api/api/model/hourly_counter_value/export/csv", params),
+                ("hourly_model_api", f"{base}/api/model/hourly_counter_value/export/csv", params),
+            ]
+        )
+
+    diagnostics: list[str] = []
+    seen_urls: set[str] = set()
+    for label, url, query_params in attempts:
+        clean_url = str(url or "").strip()
+        if not clean_url or clean_url in seen_urls:
+            continue
+        seen_urls.add(clean_url)
+        try:
+            export_res = requests.get(clean_url, params=query_params, headers=headers, timeout=60)
+            if export_res.status_code >= 400:
+                diagnostics.append(f"{label}:{export_res.status_code}")
+                continue
+
+            text = export_res.text or ""
+            if not text.strip():
+                diagnostics.append(f"{label}:empty")
+                continue
+
+            df = _parse_natisoft_csv_text(text)
+            if not df.empty:
+                return df
+
+            diagnostics.append(f"{label}:parsed-empty")
+        except Exception:
+            diagnostics.append(f"{label}:err")
+
+    raise RuntimeError(
+        "Aucune donnée horaire récupérée depuis Natisoft. Tentatives: " + " | ".join(diagnostics[:8])
+    )
 
 
 def natisoft_export_url_for_model(config: dict, model_name: str) -> str:
@@ -2391,6 +2471,7 @@ def natisoft_energy_integrator_value_urls(
     for base in natisoft_base_urls(config):
         urls.extend(
             [
+                f"{base}/sy/workspaces/{quote(workspace_clean, safe='')}/integrator/value/export/csv/{quote(default_unit, safe='')}/{quote(date_clean, safe='')}/{quote(default_period, safe='')}",
                 f"{base}/api/sy/workspaces/{quote(workspace_clean, safe='')}/integrator/value/export/csv/{quote(default_unit, safe='')}/{quote(date_clean, safe='')}/{quote(default_period, safe='')}",
                 f"{base}/api/api/sy/workspaces/{quote(workspace_clean, safe='')}/integrator/value/export/csv/{quote(default_unit, safe='')}/{quote(date_clean, safe='')}/{quote(default_period, safe='')}",
             ]
@@ -2412,6 +2493,7 @@ def natisoft_biomethane_volume_urls(config: dict, workspace_id: str) -> list[str
     for base in natisoft_base_urls(config):
         urls.extend(
             [
+                f"{base}/sy/workspaces/{workspace_clean}/integrators/volume/export/csv",
                 f"{base}/api/api/workspaces/{workspace_clean}/integrators/volume/export/csv",
                 f"{base}/api/workspaces/{workspace_clean}/integrators/volume/export/csv",
                 f"{base}/api/sy/workspaces/{workspace_clean}/integrators/volume/export/csv",
@@ -2469,6 +2551,31 @@ def infer_natisoft_model_name_from_response(response: requests.Response | None, 
             return str(values.iloc[0]).strip()
 
     return fallback_clean
+
+
+def _filter_natisoft_epurateur_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    pattern = r"epurateur|épurateur"
+
+    try:
+        as_text = df.astype(str)
+        row_mask = as_text.apply(lambda col: col.str.contains(pattern, case=False, na=False, regex=True)).any(axis=1)
+        if bool(row_mask.any()):
+            return df.loc[row_mask].reset_index(drop=True)
+    except Exception:
+        pass
+
+    matching_columns = [
+        column
+        for column in df.columns
+        if re.search(pattern, str(column), flags=re.IGNORECASE)
+    ]
+    if matching_columns:
+        return df[matching_columns].copy()
+
+    return df
 
 
 def natisoft_base_urls(config: dict) -> list[str]:
@@ -2739,6 +2846,8 @@ def fetch_natisoft_energie_data(
 
             parsed_df = _parse_natisoft_csv_text(response.text or "")
             parsed_df = _coerce_single_column_natisoft_df(parsed_df)
+            if consommation_type_clean == "epurateur" and not parsed_df.empty:
+                parsed_df = _filter_natisoft_epurateur_rows(parsed_df)
             if not parsed_df.empty:
                 attempt_model = infer_natisoft_model_name_from_response(
                     response,
@@ -5538,32 +5647,95 @@ def operator_tab(client: Client, site_id: str, ingredients: list[str], ingredien
     st.subheader("Saisie des tonnages réels")
     render_help_for_screen("ration_operateur")
 
-    selected_reacteur = st.selectbox("Réacteur en cours", options=REACTEURS, key="op_reacteur")
-
     try:
-        reactor_rows = load_fiche(client, site_id=site_id, reacteur=selected_reacteur)
+        reactor_rows = load_fiche(client, site_id=site_id)
     except Exception:
         st.error("Impossible de charger la fiche ration depuis Supabase.")
         return
 
-    if not reactor_rows:
-        st.info("Aucune ration active trouvée pour ce réacteur.")
+    today_date = date.today()
+    week_past_start = today_date - timedelta(days=7)
+    week_future_end = today_date + timedelta(days=7)
+
+    planned_by_slot: dict[tuple[str, str], list[dict]] = {}
+    for row in reactor_rows:
+        date_iso = normalize_date_value(row.get("date"))
+        reacteur = str(row.get("reacteur", "")).strip()
+        try:
+            parsed = datetime.strptime(date_iso, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if reacteur and today_date <= parsed <= week_future_end:
+            planned_by_slot.setdefault((date_iso, reacteur), []).append(row)
+
+    grid_rows: list[dict] = []
+    try:
+        history_rows, _ = load_ration_history(client, site_id)
+    except Exception:
+        history_rows = []
+
+    for history_row in history_rows:
+        reacteur = str(history_row.get("Cuve", "")).strip()
+        if not reacteur:
+            continue
+        date_iso = normalize_date_value(history_row.get("Date"))
+        try:
+            parsed = datetime.strptime(date_iso, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if week_past_start <= parsed < today_date:
+            grid_rows.append(
+                {
+                    "Période": "Semaine précédente",
+                    "Date": format_fr_date(date_iso),
+                    "Réacteur": reacteur,
+                    "Statut": "Chargée",
+                    "Tonnage (t)": round(to_float(history_row.get("Tonnage (t)"), 0.0), 3),
+                }
+            )
+
+    for date_iso, reacteur in sorted(planned_by_slot.keys()):
+        rows_for_slot = planned_by_slot[(date_iso, reacteur)]
+        grid_rows.append(
+            {
+                "Période": "Semaine à venir",
+                "Date": format_fr_date(date_iso),
+                "Réacteur": reacteur,
+                "Statut": "À saisir",
+                "Tonnage (t)": round(sum(to_float(row.get("tonnage_prevu"), 0.0) for row in rows_for_slot), 3),
+            }
+        )
+
+    st.markdown("### Grille hebdomadaire")
+    if grid_rows:
+        st.dataframe(pd.DataFrame(grid_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("Aucune ration chargée la semaine précédente ni ration à venir cette semaine.")
+
+    available_slots = sorted(planned_by_slot.keys())
+
+    if not available_slots:
+        st.info("Aucune ration à venir trouvée.")
         return
 
-    available_dates = sorted(list({row["date"] for row in reactor_rows}))
-    selected_date = available_dates[-1]
-    if len(available_dates) > 1:
-        selected_date = st.selectbox(
-            "Date prévue",
-            options=available_dates,
-            index=len(available_dates) - 1,
-            format_func=format_fr_date,
+    selected_slot = available_slots[0]
+    if len(available_slots) > 1:
+        selected_slot = st.selectbox(
+            "Ration à saisir (semaine à venir)",
+            options=available_slots,
+            index=0,
+            format_func=lambda slot: f"{format_fr_date(slot[0])} — {slot[1]}",
             key="op_date",
         )
     else:
-        st.caption(f"Date prévue chargée automatiquement : {format_fr_date(selected_date)}")
+        st.caption(
+            "Ration chargée automatiquement : "
+            f"{format_fr_date(selected_slot[0])} — {selected_slot[1]}"
+        )
 
-    planned_rows = [row for row in reactor_rows if row["date"] == selected_date]
+    selected_date, selected_reacteur = selected_slot
+
+    planned_rows = planned_by_slot.get(selected_slot, [])
     if not planned_rows:
         st.info("Aucune ligne trouvée pour cette date/réacteur.")
         return
