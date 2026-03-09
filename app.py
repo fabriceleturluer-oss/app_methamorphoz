@@ -210,6 +210,17 @@ def render_brand_header() -> None:
 
 apply_brand_theme()
 
+st.markdown(
+    """
+    <style>
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 st.markdown('<meta name="google" content="notranslate" />', unsafe_allow_html=True)
 components.html(
@@ -3756,10 +3767,15 @@ def biomethane_module(
         return
 
     overview_df = biomethane_chart_df.sort_values("date").reset_index(drop=True)
+    legend_swap_map = {
+        "Biométhane produit": "Biogaz traité",
+        "Biogaz traité": "Biométhane produit",
+    }
+    overview_df["series_label_display"] = overview_df["series_label"].map(legend_swap_map).fillna(overview_df["series_label"])
     overview_df["month"] = pd.to_datetime(overview_df["date"]).dt.to_period("M").dt.to_timestamp()
     monthly_overview_df = (
-        overview_df.groupby(["month", "series_label"], as_index=False)["consumption_value"].sum()
-        .rename(columns={"month": "date"})
+        overview_df.groupby(["month", "series_label_display"], as_index=False)["consumption_value"].sum()
+        .rename(columns={"month": "date", "series_label_display": "series_label"})
         .sort_values("date")
         .reset_index(drop=True)
     )
@@ -3837,12 +3853,40 @@ def biomethane_module(
     )
 
     chart_df = monthly_overview_df if selected_view == "Mois" else overview_df
+    selected_month_label = ""
+    if selected_view == "Jour":
+        daily_months = (
+            pd.to_datetime(overview_df["date"])
+            .dt.to_period("M")
+            .dropna()
+            .sort_values()
+            .unique()
+            .tolist()
+        )
+        if daily_months:
+            month_options = sorted(daily_months, reverse=True)
+            selected_month = st.selectbox(
+                "Mois à afficher (mois + année)",
+                options=month_options,
+                index=0,
+                format_func=lambda period_value: period_value.strftime("%m/%Y"),
+                key="biomethane_daily_month",
+            )
+            selected_month_label = selected_month.strftime("%m/%Y")
+            chart_df = overview_df[
+                pd.to_datetime(overview_df["date"]).dt.to_period("M") == selected_month
+            ].copy()
+
     x_title = "Mois" if selected_view == "Mois" else "Jour"
     y_title = "Production mensuelle" if selected_view == "Mois" else "Production journalière"
     chart_title = (
         "Production biométhane / biogaz (regroupement mensuel)"
         if selected_view == "Mois"
-        else "Production biométhane / biogaz (vue journalière)"
+        else (
+            f"Production biométhane / biogaz (vue journalière - {selected_month_label})"
+            if selected_month_label
+            else "Production biométhane / biogaz (vue journalière)"
+        )
     )
 
     production_chart = (
@@ -3852,13 +3896,13 @@ def biomethane_module(
             x=alt.X("date:T", title=x_title),
             y=alt.Y("consumption_value:Q", title=y_title),
             color=alt.Color(
-                "series_label:N",
+                "series_label_display:N" if selected_view == "Jour" else "series_label:N",
                 title="Série",
                 scale=alt.Scale(domain=["Biométhane produit", "Biogaz traité"], range=[BRAND_PRIMARY_DARK, BRAND_TEXT]),
             ),
             tooltip=[
                 alt.Tooltip("date:T", title="Date"),
-                alt.Tooltip("series_label:N", title="Série"),
+                alt.Tooltip("series_label_display:N", title="Série") if selected_view == "Jour" else alt.Tooltip("series_label:N", title="Série"),
                 alt.Tooltip("consumption_value:Q", title="Valeur", format=".2f"),
             ],
         )
