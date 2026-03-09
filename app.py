@@ -237,6 +237,7 @@ REACTEURS = [f"C{i}" for i in range(1, 11)]
 TBL_REF = "referentiel_ingredients"
 TBL_FICHE = "fiche_ration"
 TBL_SAISIES = "saisies_production"
+TBL_REGISTRE_ENTREES = "registre_entrees"
 TBL_MAINTENANCE = "maintenance_hourly_data"
 TBL_SECURITE_TORCHERE = "securite_torchere_data"
 TBL_ENERGIE = "energie_data"
@@ -302,6 +303,9 @@ RIGHTS_ITEMS = [
     ("ration", "operateur"),
     ("ration", "historique"),
     ("entrees_sorties", ""),
+    ("entrees_sorties", "stock"),
+    ("entrees_sorties", "registre_entrees"),
+    ("entrees_sorties", "registre_sorties"),
     ("qualite", ""),
     ("maintenance", ""),
     ("securite", ""),
@@ -2136,7 +2140,23 @@ def _resolve_energie_value_column(
     if 0 <= preferred_index < len(columns_in_order):
         preferred_column = str(columns_in_order[preferred_index]).strip()
         if preferred_column and preferred_column != date_column and not _is_cumul(preferred_column):
-            return preferred_column
+            if type_clean == "biomethane":
+                normalized = _norm(preferred_column)
+                looks_like_biomethane = (
+                    "biométhane" in normalized
+                    or "biomethane" in normalized
+                    or "injection" in normalized
+                    or ("production" in normalized and "biogaz" not in normalized)
+                )
+                looks_like_biogas = (
+                    "biogaz" in normalized
+                    or "gaz_in_epur" in normalized
+                    or ("epur" in normalized and "gaz" in normalized)
+                )
+                if looks_like_biomethane and not looks_like_biogas:
+                    return preferred_column
+            else:
+                return preferred_column
 
     if type_clean == "epurateur":
         for column in non_date_columns:
@@ -3747,30 +3767,67 @@ def biomethane_module(
     biomethane_daily = overview_df[overview_df["series_label"] == "Biométhane produit"].copy()
     biogas_daily = overview_df[overview_df["series_label"] == "Biogaz traité"].copy()
 
-    def _render_flow_metric(column, series_df: pd.DataFrame, label: str) -> None:
+    biomethane_counter_daily = pd.DataFrame()
+    for source_candidate in biomethane_source_candidates:
+        candidate_daily = build_energie_daily_consumption(
+            source_candidate,
+            consommation_type="biomethane",
+            site_id=site_id,
+        )
+        if not candidate_daily.empty:
+            biomethane_counter_daily = (
+                candidate_daily[["date", "consumption_value"]]
+                .sort_values("date")
+                .reset_index(drop=True)
+            )
+            break
+    if biomethane_counter_daily.empty and not biomethane_daily.empty:
+        biomethane_counter_daily = biomethane_daily[["date", "consumption_value"]].copy()
+
+    def _render_cumulative_biomethane_metrics(series_df: pd.DataFrame) -> None:
+        metric_col_1, metric_col_2 = st.columns(2)
         if series_df.empty:
-            column.metric(label, "-", "")
+            metric_col_1.metric("Biométhane produit (année)", "-")
+            metric_col_2.metric("Biométhane produit (10 jours)", "-")
             return
 
-        last_row = series_df.iloc[-1]
-        previous_value = float(series_df.iloc[-2]["consumption_value"]) if len(series_df.index) > 1 else None
-        current_value = float(last_row["consumption_value"])
-        current_date = pd.to_datetime(last_row["date"]).strftime("%d/%m/%Y")
+        working_df = series_df.copy()
+        working_df["date"] = pd.to_datetime(working_df["date"]).dt.date
+        working_df = working_df.sort_values("date").reset_index(drop=True)
 
-        delta_text = ""
-        if previous_value is not None:
-            delta_text = f"{current_value - previous_value:+.2f} Nm3/h"
+        last_date = working_df["date"].max()
+        year_start = date(last_date.year, 1, 1)
+        ten_days_start = last_date - timedelta(days=9)
 
-        column.metric(
-            label,
-            f"{current_value:.2f} Nm3/h",
-            delta_text,
-            help=f"Date: {current_date}",
+        year_scope = working_df.loc[working_df["date"] >= year_start].copy()
+        ten_days_scope = working_df.loc[working_df["date"] >= ten_days_start].copy()
+
+        year_sum = float(year_scope["consumption_value"].sum())
+        ten_days_sum = float(ten_days_scope["consumption_value"].sum())
+        year_days = max(int(year_scope["date"].nunique()), 1)
+        ten_days = max(int(ten_days_scope["date"].nunique()), 1)
+
+        year_avg_h = year_sum / (year_days * 24.0)
+        ten_days_avg_h = ten_days_sum / (ten_days * 24.0)
+
+        metric_col_1.metric(
+            "Biométhane produit (année)",
+            f"{year_avg_h:.2f} Nm3/h",
+            help=(
+                f"Du {year_start.strftime('%d/%m/%Y')} au {last_date.strftime('%d/%m/%Y')} | "
+                f"{year_days} jour(s) | calcul: somme / jours / 24"
+            ),
+        )
+        metric_col_2.metric(
+            "Biométhane produit (10 jours)",
+            f"{ten_days_avg_h:.2f} Nm3/h",
+            help=(
+                f"Du {ten_days_start.strftime('%d/%m/%Y')} au {last_date.strftime('%d/%m/%Y')} | "
+                f"{ten_days} jour(s) | calcul: somme / jours / 24"
+            ),
         )
 
-    metric_col_1, metric_col_2 = st.columns(2)
-    _render_flow_metric(metric_col_1, biomethane_daily, "Biométhane")
-    _render_flow_metric(metric_col_2, biogas_daily, "Biogaz")
+    _render_cumulative_biomethane_metrics(biomethane_counter_daily)
 
     selected_view = st.radio(
         "Vue du graphique",
@@ -4208,6 +4265,316 @@ def history_tab(client: Client, site_id: str) -> None:
     st.dataframe(pd.DataFrame(display_composition_rows), use_container_width=True, hide_index=True)
 
 
+def load_stock_consumption(
+    client: Client,
+    site_id: str,
+    start_date_iso: str,
+    end_date_iso: str,
+) -> list[dict]:
+    query = client.table(TBL_SAISIES).select("date, ingredient, tonnage_reel")
+    if site_id:
+        query = query.eq("site_id", site_id)
+    if start_date_iso:
+        query = query.gte("date", start_date_iso)
+    if end_date_iso:
+        query = query.lte("date", end_date_iso)
+
+    response = query.execute()
+    rows = response.data or []
+
+    cleaned: list[dict] = []
+    for row in rows:
+        ingredient = str(row.get("ingredient", "")).strip()
+        date_value = normalize_date_value(row.get("date"))
+        tonnage = to_float(row.get("tonnage_reel"), 0.0)
+        if ingredient and date_value and tonnage > 0:
+            cleaned.append(
+                {
+                    "date": date_value,
+                    "ingredient": ingredient,
+                    "tonnage_reel": round(tonnage, 3),
+                }
+            )
+    return cleaned
+
+
+def stock_tab(client: Client, site_id: str) -> None:
+    st.subheader("Stock - Consommations")
+
+    today = date.today()
+    default_start = today - timedelta(days=30)
+
+    c1, c2 = st.columns(2)
+    start_date = c1.date_input("Période du", value=default_start, key="stock_start_date")
+    end_date = c2.date_input("au", value=today, key="stock_end_date")
+
+    if start_date > end_date:
+        st.error("La date de début doit être antérieure ou égale à la date de fin.")
+        render_help_for_screen("entrees_sorties_stock")
+        return
+
+    try:
+        rows = load_stock_consumption(
+            client,
+            site_id=site_id,
+            start_date_iso=start_date.isoformat(),
+            end_date_iso=end_date.isoformat(),
+        )
+    except Exception as error:
+        st.error(f"Impossible de charger les consommations stock depuis Supabase: {error}")
+        render_help_for_screen("entrees_sorties_stock")
+        return
+
+    if not rows:
+        st.info("Aucune consommation disponible sur la période sélectionnée.")
+        render_help_for_screen("entrees_sorties_stock")
+        return
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df[df["date"].notna()]
+    if df.empty:
+        st.info("Aucune consommation exploitable sur la période sélectionnée.")
+        render_help_for_screen("entrees_sorties_stock")
+        return
+
+    agg_df = (
+        df.groupby("ingredient", as_index=False)
+        .agg(
+            quantite_consommee_t=("tonnage_reel", "sum"),
+            nb_saisies=("tonnage_reel", "count"),
+            nb_jours=("date", "nunique"),
+            derniere_consommation=("date", "max"),
+        )
+        .sort_values("quantite_consommee_t", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    total_t = float(agg_df["quantite_consommee_t"].sum())
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Quantité consommée (t)", format_fr_number(total_t, 3))
+    m2.metric("Ingrédients consommés", str(int(agg_df["ingredient"].nunique())))
+    m3.metric("Lignes de saisie", str(int(df.shape[0])))
+
+    display_df = agg_df.copy()
+    display_df["quantite_consommee_t"] = display_df["quantite_consommee_t"].apply(
+        lambda value: format_fr_number(value, 3)
+    )
+    display_df["derniere_consommation"] = display_df["derniere_consommation"].dt.strftime("%d/%m/%Y")
+    display_df = display_df.rename(
+        columns={
+            "ingredient": "Ingrédient",
+            "quantite_consommee_t": "Quantité consommée (t)",
+            "nb_saisies": "Nb saisies",
+            "nb_jours": "Nb jours",
+            "derniere_consommation": "Dernière consommation",
+        }
+    )
+
+    st.markdown("### Sorties calculées depuis les fiches rations")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    render_help_for_screen("entrees_sorties_stock")
+
+
+def load_entrees_sorties_register(
+    client: Client,
+    table_name: str,
+    quantity_column: str,
+    site_id: str,
+    start_date_iso: str,
+    end_date_iso: str,
+) -> list[dict]:
+    query = client.table(table_name).select(f"date, reacteur, ingredient, {quantity_column}")
+    if site_id:
+        query = query.eq("site_id", site_id)
+    if start_date_iso:
+        query = query.gte("date", start_date_iso)
+    if end_date_iso:
+        query = query.lte("date", end_date_iso)
+    response = query.execute()
+    rows = response.data or []
+
+    cleaned: list[dict] = []
+    for row in rows:
+        date_value = normalize_date_value(row.get("date"))
+        ingredient = str(row.get("ingredient", "")).strip()
+        reacteur = str(row.get("reacteur", "")).strip()
+        quantite = to_float(row.get(quantity_column), 0.0)
+        if date_value and ingredient and quantite > 0:
+            cleaned.append(
+                {
+                    "date": date_value,
+                    "reacteur": reacteur,
+                    "ingredient": ingredient,
+                    "quantite_t": round(quantite, 3),
+                }
+            )
+    cleaned.sort(key=lambda item: (item["date"], item["reacteur"], item["ingredient"]), reverse=True)
+    return cleaned
+
+
+def load_registre_entrees_rows(
+    client: Client,
+    site_id: str,
+    start_date_iso: str,
+    end_date_iso: str,
+) -> list[dict]:
+    query = client.table(TBL_REGISTRE_ENTREES).select(
+        "date, code, dechet, designation, forme, qtt_mb, ms_pct, qt_ms, nom_expediteur, adresse_expediteur, ingredient"
+    )
+    if site_id:
+        query = query.eq("site_id", site_id)
+    if start_date_iso:
+        query = query.gte("date", start_date_iso)
+    if end_date_iso:
+        query = query.lte("date", end_date_iso)
+
+    rows = query.execute().data or []
+    cleaned: list[dict] = []
+    for row in rows:
+        date_value = normalize_date_value(row.get("date"))
+        qtt_mb = to_float(row.get("qtt_mb"), 0.0)
+        ms_pct = to_float(row.get("ms_pct"), 0.0)
+        qt_ms = to_float(row.get("qt_ms"), qtt_mb * ms_pct / 100.0)
+        if not date_value:
+            continue
+
+        cleaned.append(
+            {
+                "Code": str(row.get("code", "")).strip(),
+                "Déchet": str(row.get("dechet", "")).strip(),
+                "Désignation": str(row.get("designation", "")).strip(),
+                "Forme": str(row.get("forme", "")).strip(),
+                "Date": date_value,
+                "Qtt MB": round(qtt_mb, 3),
+                "%MS": round(ms_pct, 3),
+                "Qt MS": round(qt_ms, 3),
+                "Nom expéditeur": str(row.get("nom_expediteur", "")).strip(),
+                "Adresse expéditeur": str(row.get("adresse_expediteur", "")).strip(),
+                "Ingrédient lié": str(row.get("ingredient", "")).strip(),
+            }
+        )
+
+    cleaned.sort(key=lambda item: item["Date"], reverse=True)
+    return cleaned
+
+
+def registre_entrees_tab(client: Client, site_id: str) -> None:
+    st.subheader("Registre des entrées")
+
+    today = date.today()
+    default_start = today - timedelta(days=30)
+    c1, c2 = st.columns(2)
+    start_date = c1.date_input("Période du", value=default_start, key="registre_entrees_start_date")
+    end_date = c2.date_input("au", value=today, key="registre_entrees_end_date")
+
+    if start_date > end_date:
+        st.error("La date de début doit être antérieure ou égale à la date de fin.")
+        render_help_for_screen("entrees_sorties_registre_entrees")
+        return
+
+    try:
+        rows = load_registre_entrees_rows(
+            client,
+            site_id=site_id,
+            start_date_iso=start_date.isoformat(),
+            end_date_iso=end_date.isoformat(),
+        )
+    except Exception as error:
+        st.error(f"Impossible de charger le registre des entrées: {error}")
+        render_help_for_screen("entrees_sorties_registre_entrees")
+        return
+
+    if not rows:
+        st.info("Aucune entrée disponible sur la période sélectionnée (table registre_entrees vide ou non alimentée).")
+        render_help_for_screen("entrees_sorties_registre_entrees")
+        return
+
+    df = pd.DataFrame(rows)
+    total_mb = float(df["Qtt MB"].sum())
+    total_ms = float(df["Qt MS"].sum())
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Qtt MB totale", format_fr_number(total_mb, 3))
+    m2.metric("Qt MS totale", format_fr_number(total_ms, 3))
+    m3.metric("Lignes", str(int(df.shape[0])))
+
+    display_df = df.copy()
+    display_df["Date"] = pd.to_datetime(display_df["Date"], errors="coerce").dt.strftime("%d/%m/%Y")
+    for col in ["Qtt MB", "%MS", "Qt MS"]:
+        display_df[col] = display_df[col].apply(lambda value: format_fr_number(value, 3))
+    display_df = display_df[
+        [
+            "Code",
+            "Déchet",
+            "Désignation",
+            "Forme",
+            "Date",
+            "Qtt MB",
+            "%MS",
+            "Qt MS",
+            "Nom expéditeur",
+            "Adresse expéditeur",
+        ]
+    ]
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    render_help_for_screen("entrees_sorties_registre_entrees")
+
+
+def registre_sorties_tab(client: Client, site_id: str) -> None:
+    st.subheader("Registre des sorties")
+
+    today = date.today()
+    default_start = today - timedelta(days=30)
+    c1, c2 = st.columns(2)
+    start_date = c1.date_input("Période du", value=default_start, key="registre_sorties_start_date")
+    end_date = c2.date_input("au", value=today, key="registre_sorties_end_date")
+
+    if start_date > end_date:
+        st.error("La date de début doit être antérieure ou égale à la date de fin.")
+        render_help_for_screen("entrees_sorties_registre_sorties")
+        return
+
+    try:
+        rows = load_entrees_sorties_register(
+            client,
+            table_name=TBL_SAISIES,
+            quantity_column="tonnage_reel",
+            site_id=site_id,
+            start_date_iso=start_date.isoformat(),
+            end_date_iso=end_date.isoformat(),
+        )
+    except Exception as error:
+        st.error(f"Impossible de charger le registre des sorties: {error}")
+        render_help_for_screen("entrees_sorties_registre_sorties")
+        return
+
+    if not rows:
+        st.info("Aucune sortie disponible sur la période sélectionnée.")
+        render_help_for_screen("entrees_sorties_registre_sorties")
+        return
+
+    df = pd.DataFrame(rows)
+    total_t = float(df["quantite_t"].sum())
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Quantité totale (t)", format_fr_number(total_t, 3))
+    m2.metric("Lignes", str(int(df.shape[0])))
+    m3.metric("Ingrédients", str(int(df["ingredient"].nunique())))
+
+    display_df = df.copy()
+    display_df["date"] = pd.to_datetime(display_df["date"], errors="coerce").dt.strftime("%d/%m/%Y")
+    display_df["quantite_t"] = display_df["quantite_t"].apply(lambda value: format_fr_number(value, 3))
+    display_df = display_df.rename(
+        columns={
+            "date": "Date",
+            "reacteur": "Cuve",
+            "ingredient": "Ingrédient",
+            "quantite_t": "Quantité réelle (t)",
+        }
+    )
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    render_help_for_screen("entrees_sorties_registre_sorties")
+
+
 def save_ration(client: Client, site_id: str, date_str: str, reacteur: str, lines: list[dict]) -> None:
     site_id_clean = str(site_id or "").strip()
     if not site_id_clean:
@@ -4374,6 +4741,28 @@ HELP_BY_SCREEN: dict[str, dict[str, object]] = {
             "Cliquez sur une ligne pour afficher la composition détaillée du lot.",
             "Les indicateurs affichent tonnage, potentiel et volume enregistrés.",
             "Utilisez ce tableau pour contrôle qualité et traçabilité.",
+        ],
+    },
+    "entrees_sorties_stock": {
+        "title": "Entrées/Sorties - Stock",
+        "items": [
+            "Les sorties sont calculées automatiquement à partir des lots saisis.",
+            "Filtrez la période pour suivre les quantités consommées par ingrédient.",
+            "Le tableau agrège tonnage total, nombre de saisies et dernière consommation.",
+        ],
+    },
+    "entrees_sorties_registre_entrees": {
+        "title": "Entrées/Sorties - Registre des entrées",
+        "items": [
+            "Ce registre affiche les intrants planifiés (fiche ration) sur la période.",
+            "Utilisez-le pour contrôler les quantités prévues par cuve et ingrédient.",
+        ],
+    },
+    "entrees_sorties_registre_sorties": {
+        "title": "Entrées/Sorties - Registre des sorties",
+        "items": [
+            "Ce registre affiche les sorties réellement saisies (saisies production).",
+            "Utilisez-le pour tracer les quantités consommées par date, cuve et intrant.",
         ],
     },
     "maintenance": {
@@ -6000,6 +6389,32 @@ elif active_module == "Ration":
                 operator_tab(supabase, st.session_state.selected_site_id, ingredients_list, ingredient_params_map)
             elif key == "historique":
                 history_tab(supabase, st.session_state.selected_site_id)
+elif active_module == "Entrées/Sorties":
+    if not has_permission(selected_roles, effective_rights, "entrees_sorties", ""):
+        st.error("Accès refusé au module Entrées/Sorties.")
+        st.stop()
+
+    entrees_sorties_tabs = []
+    if has_permission(selected_roles, effective_rights, "entrees_sorties", "stock"):
+        entrees_sorties_tabs.append(("📦 Stock", "stock"))
+    if has_permission(selected_roles, effective_rights, "entrees_sorties", "registre_entrees"):
+        entrees_sorties_tabs.append(("📥 Registre des entrées", "registre_entrees"))
+    if has_permission(selected_roles, effective_rights, "entrees_sorties", "registre_sorties"):
+        entrees_sorties_tabs.append(("📤 Registre des sorties", "registre_sorties"))
+
+    if not entrees_sorties_tabs:
+        st.info("Aucun sous-menu Entrées/Sorties autorisé pour votre profil.")
+        st.stop()
+
+    tab_objs = st.tabs([label for label, _ in entrees_sorties_tabs])
+    for tab_obj, (_, key) in zip(tab_objs, entrees_sorties_tabs):
+        with tab_obj:
+            if key == "stock":
+                stock_tab(supabase, st.session_state.selected_site_id)
+            elif key == "registre_entrees":
+                registre_entrees_tab(supabase, st.session_state.selected_site_id)
+            elif key == "registre_sorties":
+                registre_sorties_tab(supabase, st.session_state.selected_site_id)
 elif active_module == "Administration":
     admin_module(supabase, st.session_state.selected_site_id, selected_roles, effective_rights)
 elif active_module == "Maintenance":
